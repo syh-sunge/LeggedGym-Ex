@@ -155,6 +155,11 @@ class LeggedRobot(BaseTask):
             f"Convert with: actions = actions.float()"
         )
         
+        # 1. 先处理 action
+        # 2. 把 action 送进仿真器
+        # 3. 仿真器推进一步
+        # 4. 计算 done / reward / obs
+        # 5. 返回给 PPO
         actions = self._pre_sim_step(actions)
         self.simulator.step(actions)
         self.post_physics_step()
@@ -167,6 +172,7 @@ class LeggedRobot(BaseTask):
                 self.privileged_obs_buf, -clip_obs, clip_obs)
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
 
+    #仿真后处理
     def post_physics_step(self) -> None:
         """Process environment state after physics step.
         
@@ -188,15 +194,21 @@ class LeggedRobot(BaseTask):
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
+        #负责刷新仿真器的内部状态
         self.simulator.post_physics_step()
+        # 1. 定期重新采样 command  更新目标命令
+        # 2. 如果使用 heading command，把目标朝向转换成 yaw 速度命令
+        # 3. 按间隔随机 push robot / push links  施加随机扰动
         self._post_physics_step_callback()
 
         # compute observations, rewards, resets, ...
         self.check_termination()
+        # reward在reset前计算 因为reward要评价action造成的当前状态
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
         self.simulator.update_sensors()
+        # obs在reset之后计算 因为返回的bos是下一步要用的状态
         self.compute_observations()  # in some cases a simulation step might be required to refresh some obs (for example body positions)
         
         if self.debug:
@@ -226,11 +238,15 @@ class LeggedRobot(BaseTask):
             self.penalized_bodies_force_norm = torch.norm(self.simulator.link_contact_forces[:, self.simulator.penalized_contact_indices, :], dim=-1)
             self.feet_force_norm = torch.norm(self.simulator.link_contact_forces[:, self.simulator.feet_contact_indices, :], dim=-1)
             self.feet_max_force_z = self.simulator.link_contact_forces[:, self.simulator.feet_contact_indices, 2]
+        
+        #通过接触力判断
         fail_buf = torch.any(self.terminated_bodies_force_norm > 10.0, dim=1)
         # print(f"contact termination: {fail_buf}")
+        #判断姿态
         fail_buf |= self.simulator.projected_gravity[:, 2] > self.cfg.env.max_projected_gravity
         # print(f"gravity termination: {self.simulator.projected_gravity[:, 2] > self.cfg.env.max_projected_gravity}")
         self.fail_buf += fail_buf
+        #判断时间
         self.time_out_buf = self.episode_length_buf > self.max_episode_length  # no terminal reward for time-outs
         # print(f"time out: {self.time_out_buf}")
         self.reset_buf = (
@@ -310,6 +326,10 @@ class LeggedRobot(BaseTask):
             - rew_buf: Total reward of shape (num_envs,).
             - episode_sums: Dictionary tracking cumulative rewards per term.
         """
+        # 根据 config 里打开的 reward scales，
+        # 逐个调用对应的 _reward_xxx() 函数，
+        # 乘上权重，
+        # 累加成总 reward。
         self.rew_buf[:] = 0.
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
@@ -352,7 +372,7 @@ class LeggedRobot(BaseTask):
                                     self.simulator.projected_gravity,                                         # 3
                                     self.simulator.base_ang_vel * self.obs_scales.ang_vel,                   # 3
                                     self.commands[:, :3] * self.commands_scale,                   # 3
-                                    (self.simulator.dof_pos - self.simulator.default_dof_pos) 
+                                    (self.simulator.dof_pos - self.simulator.default_dof_pos)   #go2是12维
                                       * self.obs_scales.dof_pos, # num_dofs
                                     self.simulator.dof_vel * self.obs_scales.dof_vel,                         # num_dofs
                                     self.actions                                                    # num_actions
@@ -418,6 +438,11 @@ class LeggedRobot(BaseTask):
 
     # ------------- Callbacks (Protected Function) --------------
     
+
+    # 把ppo输出的action裁减到合法范围
+    # 保存上一时刻的action
+    # 保存上上时刻的action
+    # 当前的action写入self.actions
     def _pre_sim_step(self, actions: Action) -> Action:
         """ Callback called at the beginning of the step function, before stepping the simulation
         """
@@ -521,10 +546,12 @@ class LeggedRobot(BaseTask):
         else:
             self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
         
+        #以一定概率给0命令 让机器人学习站立
         if np.random.rand() < self.cfg.commands.zero_cmd_prob:
             self.commands[env_ids, :3] *= 0.0  # set command to zero with some probability, to encourage the robot to learn to stand still
         
         # set small commands to zero
+        #命令太小直接清
         self.commands[env_ids, :3] *= (torch.norm(
             self.commands[env_ids, :3], dim=1) > 0.2).unsqueeze(1)
 

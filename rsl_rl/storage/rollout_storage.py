@@ -36,7 +36,11 @@ from typing import Optional, Tuple, List, Generator, Union
 
 from rsl_rl.utils import split_and_pad_trajectories
 
+#存rollout数据
+#计算return/advantage
+#把数据切成mini-batch 给ppo.update()
 class RolloutStorage:
+    #transition临时数据，当前时间步的一条数据包
     class Transition:
         def __init__(self) -> None:
             self.observations: Optional[torch.Tensor] = None
@@ -53,6 +57,7 @@ class RolloutStorage:
         def clear(self) -> None:
             self.__init__()  # type: ignore[misc]
 
+    #初始化数组
     def __init__(self, num_envs: int, num_transitions_per_env: int, obs_shape: Tuple[int, ...], 
                  privileged_obs_shape: Tuple[Optional[int], ...], actions_shape: Tuple[int, ...], device: str = 'cpu') -> None:
 
@@ -90,6 +95,7 @@ class RolloutStorage:
 
         self.step: int = 0
 
+    #把一条transition写入buffer
     def add_transitions(self, transition: Transition) -> None:
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
@@ -101,6 +107,7 @@ class RolloutStorage:
         assert transition.actions_log_prob is not None
         assert transition.action_mean is not None
         assert transition.action_sigma is not None
+        #把当前 transition 写入第 self.step 个时间位置
         self.observations[self.step].copy_(transition.observations)
         if self.privileged_observations is not None and transition.critic_observations is not None: 
             self.privileged_observations[self.step].copy_(transition.critic_observations)
@@ -136,16 +143,22 @@ class RolloutStorage:
     def clear(self) -> None:
         self.step = 0
 
+    #GAE
+    #last_values是rollout最后一个状态的critic估值
     def compute_returns(self, last_values: torch.Tensor, gamma: float, lam: float) -> None:
         advantage = 0
+        #倒叙计算
         for step in reversed(range(self.num_transitions_per_env)):
             if step == self.num_transitions_per_env - 1:
                 next_values = last_values
             else:
                 next_values = self.values[step + 1]
             next_is_not_terminal = 1.0 - self.dones[step].float()
+            #TD error
             delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
+            #GAE递推
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
+            #return
             self.returns[step] = advantage + self.values[step]
 
         # Compute and normalize the advantages
@@ -159,7 +172,8 @@ class RolloutStorage:
         done_indices = torch.cat((flat_dones.new_tensor([-1], dtype=torch.int64), flat_dones.nonzero(as_tuple=False)[:, 0]))
         trajectory_lengths = (done_indices[1:] - done_indices[:-1])
         return trajectory_lengths.float().mean(), self.rewards.mean()
-
+    
+    #把rollout数据切成mini-batch
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[
         Tuple[
             torch.Tensor,  # obs_batch

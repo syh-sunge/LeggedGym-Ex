@@ -151,6 +151,8 @@ class PPO(BaseAlgorithm):
     def train_mode(self) -> None:
         self.actor_critic.train()
 
+    #采样动作并保存旧策略信息
+    #策略网络根据状态生成策略分布
     def act(self, obs: torch.Tensor, critic_obs: torch.Tensor) -> torch.Tensor:
         """Compute actions for given observations.
         
@@ -164,6 +166,8 @@ class PPO(BaseAlgorithm):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values
+        # actor 根据 obs 采样 action
+        # critic 根据 critic_obs 计算 value
         self.transition.actions = self.actor_critic.act(obs).detach()
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
@@ -174,6 +178,7 @@ class PPO(BaseAlgorithm):
         self.transition.critic_observations = critic_obs
         return self.transition.actions
     
+    #把环境反馈塞进storage也就是rollout buffer
     def process_env_step(
         self, 
         rewards: torch.Tensor, 
@@ -187,6 +192,7 @@ class PPO(BaseAlgorithm):
             dones: Done flags. Shape: [num_envs]
             infos: Info dict, may contain 'time_outs' for bootstrapping
         """
+        #把reward和done存进transition
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         # Bootstrapping on time outs
@@ -197,10 +203,12 @@ class PPO(BaseAlgorithm):
 
         # Record the transition
         assert self.storage is not None  # storage is initialized in init_storage()
-        self.storage.add_transitions(self.transition)
+        self.storage.add_transitions(self.transition) #把这一条transition存进真正的rollout buffer
         self.transition.clear()
         self.actor_critic.reset(dones)
     
+    #计算gae和return
+    #用 rewards、dones、values、last_values 倒序计算 advantage 和 return
     def compute_returns(self, last_critic_obs: torch.Tensor) -> None:
         """Compute returns and advantages using GAE.
         
@@ -212,6 +220,8 @@ class PPO(BaseAlgorithm):
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
+    #ppo真正更新网络
+    #rollout采集完成后会被切成mini-batch送入update()，update()会调用_compute_rl_loss()计算loss并更新网络
     def update(self) -> Tuple[float, float]:
         """Update policy using collected experiences.
         
@@ -280,6 +290,9 @@ class PPO(BaseAlgorithm):
         Returns:
             Tuple of (total_loss, surrogate_loss, value_loss)
         """
+        #ppo更新时比较的是
+        #旧策略 π_old 当时采样这个动作的概率
+        #当前新策略 πθ 现在认为这个动作的概率
         self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
         actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
         value_batch = self.actor_critic.evaluate(
@@ -291,7 +304,8 @@ class PPO(BaseAlgorithm):
 
         self._adjust_learning_rate(sigma_batch, old_sigma_batch, mu_batch, old_mu_batch)
 
-        # Surrogate loss
+        # Surrogate loss策略损失
+        #r_t(θ) = π_θ(a_t | s_t) / π_old(a_t | s_t)
         ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
         surrogate_loss = self._compute_surrogate_loss(ratio, advantages_batch)
 
@@ -346,6 +360,7 @@ class PPO(BaseAlgorithm):
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = self.learning_rate
     
+    #L_value = (V_θ(s_t) - R_t)^2
     def _compute_value_function_loss(
         self,
         value_batch: torch.Tensor,

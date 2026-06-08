@@ -56,6 +56,9 @@ TrainConfig = Dict[str, Any]
 class OnPolicyRunner:
     """On-policy RL training runner for PPO-style algorithms."""
 
+    #runner配置
+    #algorithm配置
+    #policy配置
     def __init__(
         self,
         env: VecEnv,
@@ -99,8 +102,11 @@ class OnPolicyRunner:
 
         self.env.reset()
     
+    #创建actor-critic网络和PPO
     def _init_agent_and_algo(self) -> None:
         """Initialize the actor-critic network and PPO algorithm."""
+        #actor 输入：普通 obs
+        #critic 输入：privileged_obs，如果没有 privileged_obs，就用普通 obs
         if self.env.num_privileged_obs is not None:
             num_critic_obs: int = self.env.num_privileged_obs 
         else:
@@ -115,6 +121,7 @@ class OnPolicyRunner:
         alg_class = eval(self.cfg["algorithm_class_name"])
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
     
+    #初始化rollout buffer：数据缓存，num_envs个环境，每个环境num_steps_per_env步，然后一起计算优势函数等等
     def _init_storage(self) -> None:
         """Initialize the rollout storage for the algorithm."""
         self.alg.init_storage(
@@ -125,6 +132,8 @@ class OnPolicyRunner:
             (self.env.num_actions,),
         )
     
+    #训练主循环开始采样
+    #先拿到actor obs和critic obs
     def learn(
         self,
         num_learning_iterations: int,
@@ -137,9 +146,11 @@ class OnPolicyRunner:
             init_at_random_ep_len: Whether to initialize episode lengths randomly.
         """
         self._pre_learn(init_at_random_ep_len)
+
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
+
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.alg.actor_critic.train()
 
@@ -150,6 +161,9 @@ class OnPolicyRunner:
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
+        #每一轮迭代学习：第一部分采样rollout 第二部分ppo update
+
+        #rollout采样
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             # Rollout
@@ -183,6 +197,7 @@ class OnPolicyRunner:
 
                 # Learning step
                 start = stop
+                #计算return advantage
                 self.alg.compute_returns(critic_obs)
             
             mean_value_loss, mean_surrogate_loss = self.alg.update()

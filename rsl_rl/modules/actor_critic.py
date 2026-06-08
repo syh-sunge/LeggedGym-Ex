@@ -57,8 +57,8 @@ class ActorCritic(nn.Module):
 
         activation = get_activation(activation)
 
-        mlp_input_dim_a = num_actor_obs
-        mlp_input_dim_c = num_critic_obs
+        mlp_input_dim_a = num_actor_obs #actor输入维度
+        mlp_input_dim_c = num_critic_obs #critic输入维度
 
         # Policy
         actor_layers = []
@@ -120,24 +120,31 @@ class ActorCritic(nn.Module):
         return self.distribution.stddev
     
     @property
+    #表示策略分布的随机性
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
+    # 动作分布更新
     def update_distribution(self, observations: torch.Tensor) -> None:
         mean = self.actor(observations)
+        #用mean和std构造高斯分布
         self.distribution = Normal(mean, mean*0. + self.std)
 
+    #训练时的采样动作，从normal中sample一个action
     def act(self, observations: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         self.update_distribution(observations)
         return self.distribution.sample()
     
+    #对每个动作维度计算 log probability，然后求和。
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)
 
+    #部属时直接输出均值
     def act_inference(self, observations: torch.Tensor) -> torch.Tensor:
         actions_mean = self.actor(observations)
         return actions_mean
 
+    #critic输出value
     def evaluate(self, critic_observations: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         value = self.critic(critic_observations)
         return value
