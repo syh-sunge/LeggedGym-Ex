@@ -215,6 +215,9 @@ class CTS_AMP_Runner(OnPolicyRunner):
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 
         if len(locs['rewbuffer']) > 0:
+            symmetry_loss_string = ""
+            if locs['mean_symmetry_loss'] is not None:
+                symmetry_loss_string = f"""{'Mean symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
             log_string = (f"""{'#' * width}\n"""
                           f"""{str.center(width, ' ')}\n\n"""
                           f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
@@ -227,7 +230,7 @@ class CTS_AMP_Runner(OnPolicyRunner):
                           f"""{'AMP grad pen loss:':>{pad}} {locs['mean_grad_pen_loss']:.4f}\n"""
                           f"""{'AMP mean policy pred:':>{pad}} {locs['mean_policy_pred']:.4f}\n"""
                           f"""{'AMP mean expert pred:':>{pad}} {locs['mean_expert_pred']:.4f}\n"""
-                          f"""{'Mean symmetry loss:':>{pad}} {locs['mean_symmetry_loss']:.4f}\n"""
+                          f"""{symmetry_loss_string}"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                           f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                           f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n""")
