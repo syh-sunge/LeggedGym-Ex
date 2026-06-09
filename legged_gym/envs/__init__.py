@@ -58,6 +58,9 @@ from legged_gym.envs.h1.h1_motion_vis.h1_motion_vis_config import H1MotionVisCfg
 # h1 DeepMimic
 from legged_gym.envs.h1.h1_deepmimic.h1_deepmimic import H1DeepMimic
 from legged_gym.envs.h1.h1_deepmimic.h1_deepmimic_config import H1DeepMimicCfg, H1DeepMimicCfgPPO
+# h1 CTS AMP
+from legged_gym.envs.h1.h1_cts_amp.h1_cts_amp import H1_CTS_AMP
+from legged_gym.envs.h1.h1_cts_amp.h1_cts_amp_config import H1_CTS_AMPCfg, H1_CTS_AMPCfgPPO
 # g1 motion visualization
 from legged_gym.envs.g1.g1_motion_vis.g1_motion_vis import G1MotionVis
 from legged_gym.envs.g1.g1_motion_vis.g1_motion_vis_config import G1MotionVisCfg
@@ -120,6 +123,7 @@ task_registry.register("g1", G1Robot, G1RoughCfg(), G1RoughCfgPPO())
 task_registry.register("h1", H1Robot, H1RoughCfg(), H1RoughCfgPPO())
 task_registry.register("h1_deepmimic", H1DeepMimic, H1DeepMimicCfg(), H1DeepMimicCfgPPO())
 task_registry.register("h1_motion_vis", H1MotionVis, H1MotionVisCfg(), LeggedRobotCfgPPO()) # for motion visualization, not for training
+task_registry.register("h1_cts_amp", H1_CTS_AMP, H1_CTS_AMPCfg(), H1_CTS_AMPCfgPPO()) # unvalidated
 task_registry.register("g1_deepmimic", G1DeepMimic, G1DeepMimicCfg(), G1DeepMimicCfgPPO())
 task_registry.register("g1_motion_vis", G1MotionVis, G1MotionVisCfg(), LeggedRobotCfgPPO()) # for motion visualization, not for training
 task_registry.register( "go2", GO2, GO2Cfg(), GO2CfgPPO())

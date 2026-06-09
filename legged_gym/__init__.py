@@ -9,12 +9,14 @@ if sys.version_info[1] >= 10: # >=3.10 for genesis and isaacsim
     simulator_type = os.getenv("SIMULATOR")
     if simulator_type == "genesis":
         SIMULATOR = "genesis"
+    elif simulator_type == "isaacgym":
+        SIMULATOR = "isaacgym"
     elif simulator_type == "isaaclab":
         SIMULATOR = "isaaclab"
     else:
-        raise ValueError("Unsupported SIMULATOR type. Please set the SIMULATOR environment variable to 'genesis' or 'isaaclab'.")
+        raise ValueError("Unsupported SIMULATOR type. Please set the SIMULATOR environment variable to 'genesis', 'isaacgym' or 'isaaclab'.")
 elif sys.version_info[1] <= 8 and sys.version_info[1] >= 6: # >=3.6 and <3.9 for isaacgym
-    SIMULATOR = "isaacgym"
+    SIMULATOR = os.getenv("SIMULATOR", "isaacgym")
 
 if SIMULATOR == "genesis":
     try: 
