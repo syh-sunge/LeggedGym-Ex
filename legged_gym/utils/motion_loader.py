@@ -229,7 +229,7 @@ class AMPLoader:
         idx_low, idx_high = int(np.floor(p * n)), int(np.ceil(p * n))
         frame_start = self.trajectories_full[traj_idx][idx_low]
         frame_end = self.trajectories_full[traj_idx][idx_high]
-        blend = p * n - idx_low
+        blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32)
         return self.blend_frame_pose(frame_start, frame_end, blend)
 
     def get_full_frame_at_time_batch(self, traj_idxs, times):
@@ -312,6 +312,8 @@ class AMPLoader:
         blend_base_pos = self.slerp(base_pos0, base_pos1, blend)
         blend_base_rot = quat_slerp(base_rot0, base_rot1, blend)
         blend_base_rot = standardize_quaternion(blend_base_rot)
+        if blend_base_rot.dim() > base_rot0.dim():
+            blend_base_rot = blend_base_rot.squeeze(0)
         blend_base_lin_vel = self.slerp(base_lin_vel0, base_lin_vel1, blend)
         blend_base_ang_vel = self.slerp(base_ang_vel0, base_ang_vel1, blend)
         blend_dof_pos = self.slerp(dof_pos0, dof_pos1, blend)
