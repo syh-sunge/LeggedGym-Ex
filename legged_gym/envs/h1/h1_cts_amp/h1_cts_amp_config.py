@@ -1,12 +1,23 @@
 import glob
+import os
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, SIMULATOR
 from legged_gym.envs.h1.h1_config import H1RoughCfg
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfgPPO
 
 
-MOTION_FILES = glob.glob(
-    LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/unitree_h1/{SIMULATOR}_run/*"
+MOTION_FILE_PATTERNS = (
+    "C1_*",
+    "lafan1_walk1*",
+    "lafan1_run1*",
+)
+MOTION_FILE_DIR = (
+    LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/unitree_h1/{SIMULATOR}_run"
+)
+MOTION_FILES = sorted(
+    motion_file
+    for motion_file in glob.glob(os.path.join(MOTION_FILE_DIR, "*.pkl"))
+    if any(os.path.basename(motion_file).startswith(pattern.rstrip("*")) for pattern in MOTION_FILE_PATTERNS)
 )
 
 
@@ -14,6 +25,7 @@ class H1_CTS_AMPCfg(H1RoughCfg):
     class env(H1RoughCfg.env):
         num_envs = 4096
         num_teacher = num_envs // 4 * 3
+        fail_to_terminal_time_s = 0.25
         frame_stack = 5
         num_observations = 41
         num_history_obs = num_observations * frame_stack
@@ -33,15 +45,40 @@ class H1_CTS_AMPCfg(H1RoughCfg):
         reference_state_initialization_prob = 0.0
 
     class domain_rand(H1RoughCfg.domain_rand):
-        randomize_com_displacement = True
-        com_pos_x_range = [-0.05, 0.05]
-        com_pos_y_range = [-0.05, 0.05]
-        com_pos_z_range = [-0.05, 0.05]
-        randomize_pd_gain = True
-        kp_range = [0.8, 1.2]
-        kd_range = [0.8, 1.2]
-        randomize_ctrl_delay = True
-        ctrl_delay_step_range = [0, 2]
+        randomize_friction = False
+        randomize_base_mass = False
+        randomize_com_displacement = False
+        push_robots = False
+        randomize_pd_gain = False
+        randomize_ctrl_delay = False
+
+    class commands(H1RoughCfg.commands):
+        heading_command = False
+        zero_cmd_prob = 0.2
+
+        class ranges(H1RoughCfg.commands.ranges):
+            lin_vel_x = [0.2, 0.8]
+            lin_vel_y = [0.0, 0.0]
+            ang_vel_yaw = [-0.2, 0.2]
+
+    class rewards(H1RoughCfg.rewards):
+        min_step_length = 0.08
+        max_step_length = 0.32
+        step_length_sigma = 0.03
+
+        class scales(H1RoughCfg.rewards.scales):
+            tracking_lin_vel = 1.2
+            tracking_ang_vel = 0.4
+            orientation = -3.0
+            base_height = -4.0
+            alive = 0.2
+            contact = 0.1
+            feet_air_time = 0.8
+            step_length = 0.8
+            single_support = 0.2
+            stand_action = -0.2
+            stand_joint_pos = -1.0
+            stand_contact = 0.4
 
 
 class H1_CTS_AMPCfgPPO(LeggedRobotCfgPPO):
@@ -76,7 +113,7 @@ class H1_CTS_AMPCfgPPO(LeggedRobotCfgPPO):
         amp_discr_hidden_dims = [1024, 512]
         amp_task_reward_lerp = 0.5
         num_steps_per_env = 24
-        max_iterations = 5000
+        max_iterations = 20000
         save_interval = 500
         run_name = f"h1_cts_amp_{SIMULATOR}"
         experiment_name = "h1_cts_amp"

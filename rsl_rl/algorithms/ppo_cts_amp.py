@@ -38,8 +38,8 @@ from rsl_rl.storage import RolloutStorageCTS
 from rsl_rl.storage.replay_buffer import ReplayBuffer
 
 '''
-PPO with concurrent teacher-student architecture, refer to https://clearlab-sustech.github.io/concurrentTS/, 
-combined with AMP for motion imitation. 
+PPO with concurrent teacher-student architecture, refer to https://clearlab-sustech.github.io/concurrentTS/,
+combined with AMP for motion imitation.
 '''
 
 
@@ -56,7 +56,7 @@ class PPO_CTS_AMP(PPO):
                  clip_param=0.2,
                  gamma=0.998,
                  lam=0.95,
-                 value_loss_coef=1.0,
+                 value_loss_coef=1.0, # vlaue loss权重
                  entropy_coef=0.0,
                  learning_rate=1e-3,
                  max_grad_norm=1.0,
@@ -91,17 +91,18 @@ class PPO_CTS_AMP(PPO):
             device,
         )
 
-        self.encoder_lr = encoder_lr
-        self.num_encoder_epochs = num_encoder_epochs
-        self.num_teacher = num_teacher
-        
+        self.encoder_lr = encoder_lr # history encoder的学习率
+        self.num_encoder_epochs = num_encoder_epochs # 每次update里，history encoder reconstruction训练几次
+        self.num_teacher = num_teacher # 表示并行环境中前多少个env用teacher branch
+
         # Discriminator components
         self.discriminator = discriminator
         self.discriminator.to(self.device)
-        self.amp_transition = RolloutStorageCTS.Transition()
+        self.amp_transition = RolloutStorageCTS.Transition() # 用来暂存当前一部的amp transition
+        # 用来存储policy产生的action用来和expert motion进行比较
         self.amp_storage = ReplayBuffer(
             discriminator.input_dim // 2, amp_replay_buffer_size, device)
-        self.amp_data = amp_data
+        self.amp_data = amp_data # 数据加载器 用来提供专家运动片段
         self.amp_normalizer = amp_normalizer
 
         # PPO components
@@ -112,7 +113,9 @@ class PPO_CTS_AMP(PPO):
                         list(self.actor_critic.critic.parameters()) + \
                         list(self.actor_critic.privilege_encoder.parameters()) + \
                         [self.actor_critic.std]
+        # 负责更新actor critic privilege_encoder std
         self.optimizer = optim.Adam(self.rl_params, lr=learning_rate)  # do not consider paramters of student encoder during RL update
+        # 负责更新history encoder CTS的蒸馏
         self.history_encoder_optimizer = optim.Adam(
             self.actor_critic.history_encoder.parameters(), lr=encoder_lr)    # for history encoder supervised learning update
         disc_params = [
@@ -120,16 +123,17 @@ class PPO_CTS_AMP(PPO):
              'weight_decay': 10e-4, 'name': 'amp_trunk'},
             {'params': self.discriminator.amp_linear.parameters(),
              'weight_decay': 10e-2, 'name': 'amp_head'}]
+        # 只更新AMP discriminator
         self.disc_optimizer = optim.Adam(disc_params, lr=disc_lr)
-        
+
         self.transition = RolloutStorageCTS.Transition()
         # symmetry config
         self.symmetry_cfg = symmetry_cfg
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, 
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape,
                      privileged_obs_shape, obs_history_shape, critic_obs_shape, action_shape):
         self.storage = RolloutStorageCTS(
-            num_envs, self.num_teacher, num_transitions_per_env, actor_obs_shape, 
+            num_envs, self.num_teacher, num_transitions_per_env, actor_obs_shape,
             privileged_obs_shape, obs_history_shape, critic_obs_shape, action_shape, self.device)
 
     def act(self, obs, privileged_obs, obs_history, critic_obs, amp_obs):
@@ -137,48 +141,63 @@ class PPO_CTS_AMP(PPO):
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # In storage, first num_teacher indices are teacher envs, the rest are student envs
         # Compute the actions and values
+
+        # teacher branch产生动作
         teacher_actions = self.actor_critic.act(obs[:self.num_teacher], None, privileged_obs[:self.num_teacher], act_type='teacher').detach()
+        # 保存teacher log_prob/mean/sigma 算ratio时需要old policy信息
         teacher_actions_log_prob = self.actor_critic.get_actions_log_prob(teacher_actions).detach()
         teacher_action_mean = self.actor_critic.action_mean.detach()
         teacher_action_sigma = self.actor_critic.action_std.detach()
+
+        # student branch产生动作
         student_actions = self.actor_critic.act(obs[self.num_teacher:], obs_history[self.num_teacher:], None, act_type='student').detach()
+        # 保存student log_prob/mean/sigma 算ratio时需要old policy信息
         student_actions_log_prob = self.actor_critic.get_actions_log_prob(student_actions).detach()
         student_action_mean = self.actor_critic.action_mean.detach()
         student_action_sigma = self.actor_critic.action_std.detach()
-        # store the actions and log probs
+
+        # 拼接teacher action 和 student action
         self.transition.actions = torch.cat((teacher_actions, student_actions), dim=0)
+        # 拼接log_prob/mean/sigma
         self.transition.actions_log_prob = torch.cat((teacher_actions_log_prob, student_actions_log_prob), dim=0)
         self.transition.action_mean = torch.cat((teacher_action_mean, student_action_mean), dim=0)
         self.transition.action_sigma = torch.cat((teacher_action_sigma, student_action_sigma), dim=0)
-        # need to record obs and critic_obs before env.step()
+
+        # 保存obs/privileged_obs/history/critic_obs
         self.transition.observations = obs.detach()
         self.transition.privileged_observations = privileged_obs.detach()
         self.transition.observation_histories = obs_history.detach()
         self.transition.critic_observations = critic_obs.detach()
+        # 保存value
         self.transition.values = self.actor_critic.evaluate(
-            self.transition.critic_observations).detach()
+        self.transition.critic_observations).detach()
         # record amp_obs for discriminator training
         self.amp_transition.observations = amp_obs
+        # 返回动作
         return self.transition.actions
-    
+
     def process_env_step(self, rewards, dones, infos, amp_obs):
+        # 保存reward和dones  reward已经经runner处理过
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
-        # Bootstrapping on time outs
+        # 处理time-Out终止
         if 'time_outs' in infos:
             self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
 
         not_done_idxs = (dones == False).nonzero().squeeze()
+        # 存AMP transition
         self.amp_storage.insert(
             self.amp_transition.observations, amp_obs)
 
-        # Record the transition
+        # 存ppo / cts transition
         self.storage.add_transitions(self.transition)
+        # 清空
         self.transition.clear()
         self.amp_transition.clear()
         self.actor_critic.reset(dones)
 
     def update(self):
+        # 初始化统计变量 用于计算update的平均loss
         mean_value_loss = 0
         mean_teacher_surrogate_loss = 0
         mean_student_surrogate_loss = 0
@@ -190,27 +209,34 @@ class PPO_CTS_AMP(PPO):
         mean_expert_pred = 0
         # symmetry metrics
         mean_symmetry_loss = 0 if self.symmetry_cfg else None
+
+        # PPO rollout mini-batch
         generator = self._get_data_generator()
+
+        # 这是poicy motion transition生成器 提供policy生成的x
         amp_policy_generator = self.amp_storage.feed_forward_generator(
             self.num_learning_epochs * self.num_mini_batches,
             self.storage.num_envs * self.storage.num_transitions_per_env //
                 self.num_mini_batches)
+        # 这是expert motion transition生成器 提供expert生成的x
         amp_expert_generator = self.amp_data.feed_forward_generator(
             self.num_learning_epochs * self.num_mini_batches,
             self.storage.num_envs * self.storage.num_transitions_per_env //
                 self.num_mini_batches)
+        # 三个generator一起zip
         for sample, sample_amp_policy, sample_amp_expert in zip(generator, amp_policy_generator, amp_expert_generator):
-            
+
+            # mini-batch中提取出来的数据
             teacher_obs_batch, teacher_privileged_obs_batch, teacher_actions_batch, \
             teacher_old_actions_log_prob_batch, teacher_advantages_batch, teacher_old_mu_batch, teacher_old_sigma_batch, \
             student_obs_batch, student_privileged_obs_batch, student_obs_histories_batch, student_actions_batch, \
             student_old_actions_log_prob_batch, student_advantages_batch, \
             critic_obs_batch, target_values_batch, returns_batch, hid_states_batch, masks_batch = sample
-            
+
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             teacher_original_batch_size = teacher_obs_batch.shape[0]
             student_original_batch_size = student_obs_batch.shape[0]
-            
+
             # Perform symmetric augmentation for teacher and student
             if self.symmetry_cfg and self.symmetry_cfg["use_data_augmentation"]:
                     # Augmentation using symmetry
@@ -242,16 +268,16 @@ class PPO_CTS_AMP(PPO):
                     # Repeat the critic batch
                     returns_batch = returns_batch.repeat(num_aug, 1)
                     target_values_batch = target_values_batch.repeat(num_aug, 1)
-                
-            
+
+            # 调用loss计算函数 ppo中的核心
             loss, teacher_surrogate_loss, student_surrogate_loss, value_loss = self._compute_rl_loss(
                 teacher_original_batch_size, student_original_batch_size, teacher_obs_batch, teacher_privileged_obs_batch, \
                 teacher_actions_batch, teacher_old_actions_log_prob_batch,
-                teacher_advantages_batch, teacher_old_mu_batch, teacher_old_sigma_batch, student_obs_batch, 
+                teacher_advantages_batch, teacher_old_mu_batch, teacher_old_sigma_batch, student_obs_batch,
                 student_obs_histories_batch, student_actions_batch, student_old_actions_log_prob_batch, student_advantages_batch,
                 critic_obs_batch, target_values_batch, returns_batch, hid_states_batch, masks_batch)
 
-            
+
             # Symmetry loss
             if self.symmetry_cfg:
                 # Obtain the symmetric actions
@@ -271,7 +297,7 @@ class PPO_CTS_AMP(PPO):
                             )
                     # Compute number of augmentations per sample
                     num_aug = int(teacher_obs_batch.shape[0] / teacher_original_batch_size)
-                    
+
                 # Actions predicted by the actor for symmetrically-augmented observations
                 mean_teacher_actions_batch = self.actor_critic.act_teacher(teacher_obs_batch.detach().clone(),
                                                                    teacher_privileged_obs_batch.detach().clone())
@@ -295,11 +321,11 @@ class PPO_CTS_AMP(PPO):
                             critic_obs=None,
                             )
                 teacher_symmetry_loss = torch.nn.MSELoss()(
-                    mean_teacher_actions_batch[teacher_original_batch_size:], 
+                    mean_teacher_actions_batch[teacher_original_batch_size:],
                     teacher_actions_mean_symm_batch.detach()[teacher_original_batch_size:]
                 )
                 student_symmetry_loss = torch.nn.MSELoss()(
-                    mean_student_actions_batch[student_original_batch_size:], 
+                    mean_student_actions_batch[student_original_batch_size:],
                     student_actions_mean_symm_batch.detach()[student_original_batch_size:]
                 )
                 symmetry_loss = teacher_symmetry_loss + student_symmetry_loss
@@ -308,29 +334,29 @@ class PPO_CTS_AMP(PPO):
                     loss += self.symmetry_cfg["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
-                        
+
             # Discriminator loss.
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
             disc_loss, amp_loss, grad_pen_loss, policy_d, expert_d = self._compute_amp_loss(
                 policy_state, policy_next_state, expert_state, expert_next_state)
             # Update discriminator.
-            self.disc_optimizer.zero_grad()
-            disc_loss.backward()
-            nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
-            self.disc_optimizer.step()
-            
+            self.disc_optimizer.zero_grad() # 清空discriminator梯度
+            disc_loss.backward() # 对disc_loss反响传播
+            nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm) # 裁剪
+            self.disc_optimizer.step() # optimizer.step 更新 discriminator 参数
+
             # Update actor-critic
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(
                 self.rl_params, self.max_grad_norm)
             self.optimizer.step()
-            
+
             if self.amp_normalizer is not None:
                 self.amp_normalizer.update(policy_state.cpu().numpy())
                 self.amp_normalizer.update(expert_state.cpu().numpy())
-            
+
             mean_value_loss += value_loss.item()
             mean_teacher_surrogate_loss += teacher_surrogate_loss.item()
             mean_student_surrogate_loss += student_surrogate_loss.item()
@@ -342,25 +368,26 @@ class PPO_CTS_AMP(PPO):
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
-        
+        # 单独更新history encoder
         generator = self._get_data_generator()
         for teacher_obs_batch, teacher_privileged_obs_batch, teacher_actions_batch, \
             teacher_old_actions_log_prob_batch, teacher_advantages_batch, teacher_old_mu_batch, teacher_old_sigma_batch, \
             student_obs_batch, student_privileged_obs_batch, student_obs_histories_batch, student_actions_batch, \
             student_old_actions_log_prob_batch, student_advantages_batch, \
             critic_obs_batch, target_values_batch, returns_batch, hid_states_batch, masks_batch in generator:
-            
+
             # Reconstruction gradient step
             for _ in range(self.num_encoder_epochs):
                 reconstruction_loss = self._compute_encoder_loss(student_obs_histories_batch, student_privileged_obs_batch)
+                # 更新history encoder
                 self.history_encoder_optimizer.zero_grad()
                 reconstruction_loss.backward()
                 nn.utils.clip_grad_norm_(
                     self.actor_critic.history_encoder.parameters(), self.max_grad_norm)
                 self.history_encoder_optimizer.step()
-            
+
                 mean_reconstruction_loss += reconstruction_loss.item()
-        
+
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_teacher_surrogate_loss /= num_updates
@@ -379,18 +406,19 @@ class PPO_CTS_AMP(PPO):
             mean_policy_pred, mean_expert_pred, mean_symmetry_loss
 
     def _compute_rl_loss(self, teacher_original_batch_size, student_original_batch_size, teacher_obs_batch, teacher_privileged_obs_batch, teacher_actions_batch, teacher_old_actions_log_prob_batch,
-                         teacher_advantages_batch, teacher_old_mu_batch, teacher_old_sigma_batch, student_obs_batch, 
-                         student_obs_histories_batch, student_actions_batch, student_old_actions_log_prob_batch, 
+                         teacher_advantages_batch, teacher_old_mu_batch, teacher_old_sigma_batch, student_obs_batch,
+                         student_obs_histories_batch, student_actions_batch, student_old_actions_log_prob_batch,
                          student_advantages_batch, critic_obs_batch, target_values_batch, returns_batch, hid_states_batch, masks_batch):
         # Teacher update
         self.actor_critic.act(
                 teacher_obs_batch, None, teacher_privileged_obs_batch, act_type='teacher', masks=masks_batch, hidden_states=hid_states_batch[0])
+        # 计算旧action在新policy下的概率
         teacher_actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
                 teacher_actions_batch)
         teacher_entropy_batch = self.actor_critic.entropy[:teacher_original_batch_size]
         teacher_mu_batch = self.actor_critic.action_mean[:teacher_original_batch_size]
         teacher_sigma_batch = self.actor_critic.action_std[:teacher_original_batch_size]
-            
+
         ## Teacher KL, adapt learning rate
         if self.desired_kl != None and self.schedule == 'adaptive':
             with torch.inference_mode():
@@ -417,14 +445,14 @@ class PPO_CTS_AMP(PPO):
         surrogate_clipped = -torch.squeeze(teacher_advantages_batch) * torch.clamp(ratio, 1.0 - self.clip_param,
                                                                                1.0 + self.clip_param)
         teacher_surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-            
+
         # Student update
         self.actor_critic.act(
             student_obs_batch, student_obs_histories_batch, None, act_type='student', masks=masks_batch, hidden_states=hid_states_batch[0])
         student_actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
             student_actions_batch)
         student_entropy_batch = self.actor_critic.entropy[:student_original_batch_size]
-            
+
         ## Surrogate loss
         ratio = torch.exp(student_actions_log_prob_batch -
                               torch.squeeze(student_old_actions_log_prob_batch))
@@ -432,7 +460,7 @@ class PPO_CTS_AMP(PPO):
         surrogate_clipped = -torch.squeeze(student_advantages_batch) * torch.clamp(ratio, 1.0 - self.clip_param,
                                                                                1.0 + self.clip_param)
         student_surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-        
+
         # Value
         value_batch = self.actor_critic.evaluate(
                 critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -448,24 +476,24 @@ class PPO_CTS_AMP(PPO):
             value_loss = (returns_batch - value_batch).pow(2).mean()
 
         total_entropy_batch = torch.cat((teacher_entropy_batch, student_entropy_batch), dim=0)
-            
+
         loss = self.value_loss_coef * value_loss + \
             teacher_surrogate_loss + student_surrogate_loss \
                 - self.entropy_coef * (total_entropy_batch.mean())
-        
+
         return loss, teacher_surrogate_loss, student_surrogate_loss, value_loss
-    
+
     def _compute_encoder_loss(self, student_obs_histories_batch, student_privileged_obs_batch):
         encoder_predictions = self.actor_critic.history_encoder(student_obs_histories_batch)
-                
+
         with torch.no_grad(): # don't backpropagate through the encoder targets
             encoder_targets = self.actor_critic.privilege_encoder(student_privileged_obs_batch)
 
         reconstruction_loss = nn.functional.mse_loss( # use mse loss
             encoder_predictions, encoder_targets)
-        
+
         return reconstruction_loss
-    
+
     def _compute_amp_loss(self, policy_state, policy_next_state,
                                 expert_state, expert_next_state):
         if self.amp_normalizer is not None:
@@ -484,5 +512,5 @@ class PPO_CTS_AMP(PPO):
         grad_pen_loss = self.discriminator.compute_grad_pen(
                 expert_state, expert_next_state, lambda_=10)
         disc_loss = amp_loss + grad_pen_loss
-        
+
         return disc_loss, amp_loss, grad_pen_loss, policy_d, expert_d

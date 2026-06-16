@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -35,27 +35,28 @@ import statistics
 
 import torch
 
-from rsl_rl.algorithms import PPO_CTS_AMP
-from rsl_rl.modules import ActorCriticCTS
+from rsl_rl.algorithms import PPO_CTS_AMP # 该文件中只负责调用update，不进行具体运算
+from rsl_rl.modules import ActorCriticCTS # runner会创建这个网络 传给PPO_CTS_AMP
 from rsl_rl.env import VecEnv
 from .on_policy_runner import OnPolicyRunner
 from rsl_rl.modules.amp_discriminator import AMPDiscriminator
-from legged_gym.utils.motion_loader import AMPLoader
-from rsl_rl.utils.utils import Normalizer
+from legged_gym.utils.motion_loader import AMPLoader # 负责加载专家数据
+from rsl_rl.utils.utils import Normalizer # 归一化
 
 
 class CTS_AMP_Runner(OnPolicyRunner):
 
     def __init__(self,
                  env: VecEnv,
-                 train_cfg,
+                 train_cfg, # 训练配置
                  log_dir=None,
                  device='cpu'):
 
         super().__init__(env, train_cfg, log_dir, device)
-    
+
+    # 真正的初始化
     def _init_agent_and_algo(self):
-        # actor_critic
+        # 创建actor_critic_cts
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCriticCTS
         actor_critic: ActorCriticCTS = actor_critic_class( self.env.num_obs,
                                                         self.env.num_actions,
@@ -65,40 +66,48 @@ class CTS_AMP_Runner(OnPolicyRunner):
                                                         self.env.num_critic_obs,
                                                         **self.policy_cfg).to(self.device)
         # amp
+        # 创建ampLoader 加载专家数据
         amp_data = AMPLoader(
-            self.device, 
+            self.device,
             num_dof=self.env.num_actions,
             num_key_bodies=len(self.env.simulator.key_body_indices),
-            time_between_frames=self.env.dt, 
+            time_between_frames=self.env.dt,
             preload_transitions=True,
             num_preload_transitions=self.cfg['amp_num_preload_transitions'],
             motion_files=self.cfg["amp_motion_files"])
         amp_normalizer = Normalizer(amp_data.observation_dim)
+        # 创建AMP判别器
         discriminator = AMPDiscriminator(
-            amp_data.observation_dim * 2,
-            self.cfg['amp_reward_coef'],
+            amp_data.observation_dim * 2, # 说明discriminator输入不是但帧 而是两帧拼接
+            self.cfg['amp_reward_coef'],  # 控制amp的奖励强度
             self.cfg['amp_discr_hidden_dims'], self.device,
-            self.cfg['amp_task_reward_lerp']).to(self.device)
+            self.cfg['amp_task_reward_lerp']).to(self.device) # 控制amp reward和task reward的混合比例
         alg_class = eval(self.cfg["algorithm_class_name"]) # PPO_CTS_AMP
-        self.alg: PPO_CTS_AMP = alg_class(actor_critic, 
-                                      discriminator, 
-                                      amp_data, 
-                                      amp_normalizer, 
+        # 创建PPO_CTS_AMP算法
+        self.alg: PPO_CTS_AMP = alg_class(actor_critic,
+                                      discriminator,
+                                      amp_data,
+                                      amp_normalizer,
                                       device=self.device,
                                       **self.alg_cfg,
                                       num_teacher=self.env.num_teacher)
-    
+
+    # 初始化rollout storage
     def _init_storage(self):
-        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, 
-                              [self.env.num_obs], [self.env.num_privileged_obs], 
+        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env,
+                              [self.env.num_obs], [self.env.num_privileged_obs],
                               [self.env.num_history_obs], [self.env.num_critic_obs], [self.env.num_actions])
-    
+
+    # 主训练循环
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        # 训练前准备
         self._pre_learn(init_at_random_ep_len)
-        obs, privileged_obs, obs_history, critic_obs = self.env.get_observations()
-        amp_obs = self.env.get_amp_observations()
+        # 拿到观测
+        obs, privileged_obs, obs_history, critic_obs = self.env.get_observations() # policy/critic用的obs
+        amp_obs = self.env.get_amp_observations() # AMP discriminator用的obs
         obs, privileged_obs, obs_history, critic_obs, amp_obs = obs.to(self.device), privileged_obs.to(self.device), \
             obs_history.to(self.device), critic_obs.to(self.device), amp_obs.to(self.device)
+        # 切换到train模式
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
         self.alg.discriminator.train() # switch to train mode (for dropout for example)
 
@@ -109,40 +118,54 @@ class CTS_AMP_Runner(OnPolicyRunner):
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
+        # 进入iteration循环
+        # 外层采样循环 it表示第几次迭代
+        # 一次it不是环境一步，而是一次完整的ppo训练周期
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             # Rollout
-            with torch.inference_mode():
+            with torch.inference_mode(): # 进入采样阶段
+                # 内层采样循环 (rollout step循环)
+                # 每执行一次循环就让所有并行环境前进一步
                 for i in range(self.num_steps_per_env):
+                    #  用当前策略采样动作 在ppo_cts_amp中的act()将teacher和student的action拼接在一起
+                    #  拼接的意义：环境是并行环境，将teacher和student的action同时在不同环境下执行
                     actions = self.alg.act(obs, privileged_obs, obs_history, critic_obs, amp_obs)
                     obs, privileged_obs, obs_history, critic_obs, rewards, dones, infos, \
-                        reset_env_ids, terminal_amp_states = self.env.step(actions)
-                    next_amp_obs = self.env.get_amp_observations()
+                        reset_env_ids, terminal_amp_states = self.env.step(actions) # 环境执行动作
+                    next_amp_obs = self.env.get_amp_observations() # 获取下一帧的AMP observation
+                    # 搬到device上
                     obs, privileged_obs, obs_history, rewards, dones, critic_obs, next_amp_obs = obs.to(self.device), \
                         privileged_obs.to(self.device), obs_history.to(self.device), rewards.to(self.device), dones.to(self.device), \
                             critic_obs.to(self.device), next_amp_obs.to(self.device)
-                    
+
                     # Account for terminal states. Use amp states before reset_idx
-                    next_amp_obs_with_term = torch.clone(next_amp_obs)
-                    next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
-                    
+                    # 修正done环境的AMP next state
+                    # AMP discriminator要判断连续运动的transition
+                    next_amp_obs_with_term = torch.clone(next_amp_obs) # 复制下一帧的AMP observation
+                    next_amp_obs_with_term[reset_env_ids] = terminal_amp_states # 对于已经 reset 的环境，用 reset 前保存的终止 AMP 状态替换
+
+                    # 计算AMP reward融合task reward
                     rewards, amp_reward = self.alg.discriminator.predict_amp_reward(
                         amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer)
-                    amp_obs = torch.clone(next_amp_obs)
-                    
+                    amp_obs = torch.clone(next_amp_obs) # 更新当前的AMP obs，为了下一步的内层循环使用
+
+                    # 存储transition 也存入storage
                     self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
-                    
+
                     if self.log_dir is not None:
                         # Book keeping
                         if 'episode' in infos:
                             # add amp reward to episode info for terminal logging
                             infos['episode']['rew_amp'] = amp_reward / self.env.dt
                             ep_infos.append(infos['episode'])
+                        # 累积总奖励
                         cur_reward_sum += rewards
                         cur_episode_length += 1
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        new_ids = (dones > 0).nonzero(as_tuple=False) # 找出done的环境
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()) # 记录结束epiode的reward和长度 把已经结束的episode的总reward放入rewbuffer
+                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()) # 把已经结束的episode长度放入lenbuffer
+                        # 清零结束环境的累计量
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
@@ -151,12 +174,14 @@ class CTS_AMP_Runner(OnPolicyRunner):
 
                 # Learning step
                 start = stop
-                self.alg.compute_returns(critic_obs)
+                self.alg.compute_returns(critic_obs) # PPO需要用最后一帧的alue来计算state alue，用return估计
 
+            # 开始update 也就是训练更新
             mean_value_loss, mean_teacher_surrogate_loss, \
                 mean_student_surrogate_loss, mean_reconstruction_loss,\
                 mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, \
                 mean_expert_pred, mean_symmetry_loss = self.alg.update()
+            # 统计学习时间
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -164,7 +189,7 @@ class CTS_AMP_Runner(OnPolicyRunner):
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
-        
+
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
 
@@ -256,17 +281,19 @@ class CTS_AMP_Runner(OnPolicyRunner):
                        f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
         print(log_string)
-    
+
+    #
     def save(self, path, infos=None):
         torch.save({
             'model_state_dict': self.alg.actor_critic.state_dict(),
-            'optimizer_state_dict': self.alg.optimizer.state_dict(),
+            'optimizer_state_dict': self.alg.optimizer.state_dict(), # optimizer是优化器：根据loss的梯度，更新神经网络参数
             'discriminator_state_dict': self.alg.discriminator.state_dict(),
             'amp_normalizer': self.alg.amp_normalizer,
             'iter': self.current_learning_iteration,
             'infos': infos,
             }, path)
-    
+
+    # 从cherkpoint文件中恢复训练状态
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, weights_only=False)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
@@ -277,8 +304,9 @@ class CTS_AMP_Runner(OnPolicyRunner):
         self.current_learning_iteration = loaded_dict['iter']
         return loaded_dict['infos']
 
+    # 获取部署/测试时使用的policy函数
     def get_inference_policy(self, device=None):
-        self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
+        self.alg.actor_critic.eval() # 切换到eval网络 训练时用train网络 部署时用eval网络
         if device is not None:
             self.alg.actor_critic.to(device)
         return self.alg.actor_critic.act_student

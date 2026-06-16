@@ -247,6 +247,21 @@ def export_policy(alg_runner, path: str, args, env_cfg, train_cfg, task_type):
         print('Exported policy as onnx to: ', path)
     
 
+def get_export_path(train_cfg):
+    log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
+    load_path = get_load_path(
+        log_root,
+        load_run=train_cfg.runner.load_run,
+        checkpoint=train_cfg.runner.checkpoint,
+    )
+    load_run = os.path.basename(os.path.dirname(load_path))
+    checkpoint_name = os.path.splitext(os.path.basename(load_path))[0]
+    if checkpoint_name.startswith('model_'):
+        train_cfg.runner.checkpoint = int(checkpoint_name.split('_', 1)[1])
+    train_cfg.runner.load_run = load_run
+    return os.path.join(log_root, load_run, 'exported')
+
+
 def play(args):
     """Main function to run the play script
 
@@ -274,8 +289,7 @@ def play(args):
     policy = ppo_runner.get_inference_policy(device=env.device)
     
     # export policy as a jit module (used to run it from C++ or python)
-    path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 
-                            train_cfg.runner.load_run, 'exported')
+    path = get_export_path(train_cfg)
     export_policy(ppo_runner, path, args, env_cfg, train_cfg, task_type)
 
     interaction_loop(env, policy, args, task_type)
